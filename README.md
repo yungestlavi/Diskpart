@@ -6,9 +6,9 @@ Diskpart Detector is an advanced forensic PowerShell script designed to monitor,
 
 You can run the script directly from an elevated PowerShell session without downloading the file:
 
-`powershell
+```
 irm https://raw.githubusercontent.com/yungestlavi/Diskpart/main/Diskpart%20detection.ps1 | iex
-`
+```
 
 *(Note: Ensure the URL matches your actual GitHub repository name and path)*
 
