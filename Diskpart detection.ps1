@@ -209,8 +209,16 @@ function Check-PartitionStatus {
         return $null
     }
 
-    Write-Host "================================================================" -ForegroundColor Cyan
-    Write-Host " PARTITION STATUS REPORT" -ForegroundColor Cyan
+    $headerAscii = @"
+  ____  _     _                     _     ____       _           _             
+ |  _ \(_)___| | ___ __   __ _ _ __| |_  |  _ \  ___| |_ ___  ___| |_ ___  _ __ 
+ | | | | / __| |/ / '_ \ / _` | '__| __| | | | |/ _ \ __/ _ \/ __| __/ _ \| '__|
+ | |_| | \__ \   <| |_) | (_| | |  | |_  | |_| |  __/ ||  __/ (__| || (_) | |   
+ |____/|_|___/_|\_\ .__/ \__,_|_|   \__| |____/ \___|\__\___|\___|\__\___/|_|   
+                  |_|                                                          
+"@
+    Write-Host $headerAscii -ForegroundColor Cyan
+    Write-Host " Made by yungestlavi 💜" -ForegroundColor Magenta
     Write-Host "================================================================" -ForegroundColor Cyan
 
     Write-Host "`n[1/3] VISIBLE & ACCESSIBLE PARTITIONS" -ForegroundColor Cyan
@@ -260,6 +268,13 @@ function Check-PartitionStatus {
     } else {
         Write-Host "  No hidden or inaccessible user partitions found." -ForegroundColor Gray
     }
+
+    Write-Host "`n================================================================" -ForegroundColor Cyan
+    Write-Host " my social" -ForegroundColor White
+    Write-Host " github -> github.com/yungestlavi" -ForegroundColor Gray
+    Write-Host " discord -> yungestlavi" -ForegroundColor Gray
+    Write-Host " youtube -> yungestlavi" -ForegroundColor Gray
+    Write-Host "================================================================`n" -ForegroundColor Cyan
 }
 
 Check-PartitionStatus
