@@ -7,7 +7,7 @@ Diskpart Detector is an advanced forensic PowerShell script designed to monitor,
 You can run the script directly from an elevated PowerShell session without downloading the file:
 
 `powershell
-irm https://raw.githubusercontent.com/yungestlavi/DiskpartDetector/main/Detect-PartitionChanges.ps1 | iex
+irm https://raw.githubusercontent.com/yungestlavi/Diskpart/main/Diskpart%20detection.ps1 | iex
 `
 
 *(Note: Ensure the URL matches your actual GitHub repository name and path)*
@@ -33,7 +33,7 @@ If you prefer to download and run the script locally:
 2. Navigate to the directory containing the script.
 3. Execute the script:
    `powershell
-   .\Detect-PartitionChanges.ps1
+   .\Diskpart detection.ps1
    `
 
 ## Output Categories
