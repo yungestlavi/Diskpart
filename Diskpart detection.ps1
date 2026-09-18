@@ -414,7 +414,8 @@ function Check-PartitionStatus {
 
         try {
             $style = [BitConverter]::ToUInt32($Blob, 0)
-            $count = [int][BitConverter]::ToUInt32($Blob, 4)
+            # bytes 4-7 are alignment padding, not a partition count field -
+            # the real count is derived from the array's own length below
 
             if ($style -eq 0) {
                 $layout.Style = "MBR"
@@ -426,10 +427,14 @@ function Check-PartitionStatus {
                 $layout.Style = "RAW"
             }
 
+            # NOTE: there is no usable partition-count field inside this blob at
+            # offset+4 - those 4 bytes are pure alignment padding before the
+            # Mbr.Signature / Gpt.DiskId union (confirmed: the MBR signature at
+            # offset+8 decodes correctly and matches the real disk signature).
+            # The true entry count must be derived from the array's own length.
             $entrySize = 144
             $base = 48
-            $maxEntries = [int][Math]::Floor(($Blob.Length - $base) / $entrySize)
-            if ($count -lt 0 -or $count -gt $maxEntries) { $count = $maxEntries }
+            $count = [int][Math]::Floor(($Blob.Length - $base) / $entrySize)
 
             $parts = @()
             for ($i = 0; $i -lt $count; $i++) {
