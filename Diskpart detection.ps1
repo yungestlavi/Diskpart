@@ -520,10 +520,12 @@ function Check-PartitionStatus {
                         $serial = ""
                         if ($data.ContainsKey('SerialNumber') -and $data['SerialNumber']) { $serial = ([string]$data['SerialNumber']).Trim() }
 
+                        # identity taken from the partition table itself: it stays stable
+                        # even when an event does not carry the serial number
                         $key = "DISK:$diskNumber"
-                        if ($serial) { $key = "SN:$serial" }
-                        elseif ($layout.DiskId) { $key = "ID:$($layout.DiskId)" }
+                        if ($layout.DiskId) { $key = "ID:$($layout.DiskId)" }
                         elseif ($layout.Signature -ne 0) { $key = "SIG:$($layout.Signature)" }
+                        elseif ($serial) { $key = "SN:$serial" }
 
                         $history += [PSCustomObject]@{
                             Time       = $e.TimeCreated
@@ -596,66 +598,138 @@ function Check-PartitionStatus {
     # Rebuilds the drive letter of a partition that no longer exists:
     #  1) HKLM\SYSTEM\MountedDevices  (MBR = signature + offset, GPT = DMIO:ID: + partition GUID)
     #  2) the saved baseline of this session
-    function Resolve-DeletedDriveLetter {
-        param(
-            [long]$Offset,
-            [uint32]$Signature,
-            [string]$PartitionId,
-            $Baseline
-        )
-
-        $wantedId = (([string]$PartitionId) -replace '[{}]', '').ToLower()
-        if ($wantedId -eq '00000000-0000-0000-0000-000000000000') { $wantedId = "" }
-
-        $found = ""
-
+    # Reads HKLM\SYSTEM\MountedDevices once.
+    #   \DosDevices\X:      -> drive letter
+    #   \??\Volume{GUID}    -> volume GUID
+    # Both point at the same binary value, so a letter can be linked to its volume GUID.
+    # Binary value: 12 bytes = MBR (disk signature + byte offset)
+    #               24 bytes = GPT ("DMIO:ID:" + partition GUID)
+    function Get-MountedDeviceEntries {
+        $entries = @()
         $md = $null
         try { $md = Get-ItemProperty -Path 'HKLM:\SYSTEM\MountedDevices' -ErrorAction SilentlyContinue } catch { }
+        if (-not $md) { return $entries }
 
-        if ($md) {
-            foreach ($prop in $md.PSObject.Properties) {
-                if ($found) { break }
+        foreach ($prop in $md.PSObject.Properties) {
+            $data = $prop.Value
+            if ($data -isnot [byte[]]) { continue }
 
-                $m = [regex]::Match($prop.Name, '^\\DosDevices\\([A-Za-z]):$')
-                if (-not $m.Success) { continue }
+            $name = [string]$prop.Name
+            $kind = ""
+            $letter = ""
+            $volumeGuid = ""
 
-                $data = $prop.Value
-                if ($data -isnot [byte[]]) { continue }
+            $mL = [regex]::Match($name, '^\\DosDevices\\([A-Za-z]):$')
+            $mV = [regex]::Match($name, '^\\\?\?\\Volume\{([0-9A-Fa-f\-]+)\}$')
 
-                if ($data.Length -eq 12 -and $Signature -ne 0) {
-                    try {
-                        $sig = [BitConverter]::ToUInt32($data, 0)
-                        $off = [BitConverter]::ToInt64($data, 4)
-                        if ($sig -eq $Signature -and $off -eq $Offset) { $found = $m.Groups[1].Value.ToUpper() }
-                    } catch { }
-                } elseif ($data.Length -ge 24 -and $wantedId) {
-                    $prefix = ""
-                    try { $prefix = [Text.Encoding]::ASCII.GetString($data, 0, 8) } catch { }
-                    if ($prefix -eq 'DMIO:ID:') {
-                        $g = ((Get-GuidFromBytes -Bytes $data -Offset 8) -replace '[{}]', '').ToLower()
-                        if ($g -and $g -eq $wantedId) { $found = $m.Groups[1].Value.ToUpper() }
-                    }
+            if ($mL.Success) {
+                $kind = "Letter"
+                $letter = $mL.Groups[1].Value.ToUpper()
+            } elseif ($mV.Success) {
+                $kind = "Volume"
+                $volumeGuid = $mV.Groups[1].Value.ToLower()
+            } else {
+                continue
+            }
+
+            $offset    = [long]-1
+            $signature = [uint32]0
+            $partGuid  = ""
+
+            if ($data.Length -eq 12) {
+                try {
+                    $signature = [BitConverter]::ToUInt32($data, 0)
+                    $offset    = [BitConverter]::ToInt64($data, 4)
+                } catch { }
+            } elseif ($data.Length -ge 24) {
+                $prefix = ""
+                try { $prefix = [Text.Encoding]::ASCII.GetString($data, 0, 8) } catch { }
+                if ($prefix -eq 'DMIO:ID:') {
+                    $partGuid = ((Get-GuidFromBytes -Bytes $data -Offset 8) -replace '[{}]', '').ToLower()
                 }
+            }
+
+            $hex = ""
+            try { $hex = [BitConverter]::ToString($data) } catch { }
+
+            $entries += [PSCustomObject]@{
+                Kind          = $kind
+                Letter        = $letter
+                VolumeGuid    = $volumeGuid
+                Hex           = $hex
+                Offset        = $offset
+                Signature     = $signature
+                PartitionGuid = $partGuid
             }
         }
 
-        if (-not $found -and $Baseline -and $Baseline.Partitions) {
-            foreach ($bp in $Baseline.Partitions) {
-                if ($found) { break }
-                if (-not $bp.DriveLetter) { continue }
+        return $entries
+    }
 
-                $bg = (([string]$bp.Guid) -replace '[{}]', '').ToLower()
-                if ($wantedId -and $bg -and $bg -eq $wantedId) {
-                    $found = ([string]$bp.DriveLetter).ToUpper()
-                } else {
-                    $bOffset = [long]-1
-                    try { $bOffset = [long]$bp.Offset } catch { }
-                    if ($bOffset -ge 0 -and $bOffset -eq $Offset) { $found = ([string]$bp.DriveLetter).ToUpper() }
-                }
+    function Find-LetterEntryForPartition {
+        param($MdLetters, [long]$Offset, [uint32]$Signature, [string]$PartitionGuid)
+
+        $wanted = (([string]$PartitionGuid) -replace '[{}]', '').ToLower()
+        if ($wanted -eq '00000000-0000-0000-0000-000000000000') { $wanted = "" }
+
+        $hit = $null
+        foreach ($e in $MdLetters) {
+            if ($hit) { break }
+            if ($wanted -and $e.PartitionGuid -and $e.PartitionGuid -eq $wanted) { $hit = $e }
+            elseif ($Signature -ne 0 -and $e.Signature -eq $Signature -and $e.Offset -ge 0 -and $e.Offset -eq $Offset) { $hit = $e }
+        }
+        return $hit
+    }
+
+    function Find-LetterInBaseline {
+        param($Baseline, [long]$Offset, [string]$PartitionGuid)
+
+        if (-not $Baseline -or -not $Baseline.Partitions) { return "" }
+
+        $wanted = (([string]$PartitionGuid) -replace '[{}]', '').ToLower()
+        if ($wanted -eq '00000000-0000-0000-0000-000000000000') { $wanted = "" }
+
+        $found = ""
+        foreach ($bp in $Baseline.Partitions) {
+            if ($found) { break }
+            if (-not $bp.DriveLetter) { continue }
+
+            $bg = (([string]$bp.Guid) -replace '[{}]', '').ToLower()
+            if ($wanted -and $bg -and $bg -eq $wanted) {
+                $found = ([string]$bp.DriveLetter).ToUpper()
+            } else {
+                $bo = [long]-1
+                try { $bo = [long]$bp.Offset } catch { }
+                if ($bo -ge 0 -and $bo -eq $Offset) { $found = ([string]$bp.DriveLetter).ToUpper() }
             }
         }
-
         return $found
+    }
+
+    # Exact teardown time of ONE volume device: matched either on its own volume GUID
+    # or on its byte offset, never on a generic text search in the System log.
+    function Get-PnpTimeForVolume {
+        param($PnpRecords, $VolumeGuids, [long]$Offset)
+
+        # the volume GUID is unique, the byte offset is not (two disks can share it),
+        # so the GUID always wins and the offset is only a second choice
+        $guidHits = @()
+        if ($VolumeGuids) {
+            foreach ($r in $PnpRecords) {
+                $instLower = ([string]$r.Instance).ToLower()
+                foreach ($g in $VolumeGuids) {
+                    if ($g -and $instLower.Contains([string]$g)) { $guidHits += $r; break }
+                }
+            }
+        }
+        if ($guidHits.Count -gt 0) { return (@($guidHits | Sort-Object Time))[0].Time }
+
+        if ($Offset -ge 0) {
+            $offsetHits = @($PnpRecords | Where-Object { $_.Offset -ge 0 -and $_.Offset -eq $Offset })
+            if ($offsetHits.Count -gt 0) { return (@($offsetHits | Sort-Object Time))[0].Time }
+        }
+
+        return $null
     }
 
     # ========================
@@ -724,18 +798,15 @@ function Check-PartitionStatus {
     # DELETED PARTITIONS (EVENT LOG DIFF + BASELINE COMPARISON + ORPHANED LETTERS)
     # ========================
 
-    $deletedList = @()
-    $deletedKeys = @{}
+    $deletedList     = @()
+    $deletedKeys     = @{}
+    $reportedLetters = @{}
 
-    # --- map of what is alive right now (signature / offset / partition guid) ---
-    $diskSignatures     = @{}
+    # --- what is alive right now ---
     $presentSerials     = @{}
     $presentDiskNumbers = @{}
     try {
         foreach ($d in @(Get-Disk -ErrorAction SilentlyContinue)) {
-            $sig = [uint32]0
-            try { if ($d.Signature) { $sig = [uint32]([long]$d.Signature -band 0xFFFFFFFF) } } catch { }
-            $diskSignatures[[int]$d.Number] = $sig
             $presentDiskNumbers[[int]$d.Number] = $true
             if ($d.SerialNumber) { $presentSerials[([string]$d.SerialNumber).Trim()] = $true }
         }
@@ -748,10 +819,13 @@ function Check-PartitionStatus {
         if ($cp.Guid) { $liveGuids[(([string]$cp.Guid) -replace '[{}]', '').ToLower()] = $true }
     }
 
+    $mdEntries     = @(Get-MountedDeviceEntries)
+    $mdLetters     = @($mdEntries | Where-Object { $_.Kind -eq 'Letter' })
     $pnpDeletions  = @(Get-PnpVolumeDeletionRecords -AfterTime $logonTime)
     $layoutHistory = @(Get-DiskLayoutHistory)
 
-    # --- 1) authoritative source: diff of consecutive partition tables logged by Windows ---
+    # --- 1) partition table diff: every single change has its own 1006 event,
+    #        so every deletion gets its own exact timestamp ---
     $layoutDeletions = @()
     if ($layoutHistory.Count -gt 0) {
         foreach ($group in ($layoutHistory | Group-Object -Property Key)) {
@@ -784,15 +858,10 @@ function Check-PartitionStatus {
                     }
                     if ($stillThere) { continue }
 
-                    # refine the timestamp with the Kernel-PnP volume teardown, if present
-                    $deleteTime = $cur.Time
-                    $pnpMatch = @($pnpDeletions | Where-Object { $_.Offset -eq $pp.Offset })
-                    if ($pnpMatch.Count -gt 0) {
-                        $deleteTime = (@($pnpMatch | Sort-Object Time))[0].Time
-                    }
-
+                    # the timestamp IS the event that no longer contains the partition:
+                    # one event per diskpart operation, so no two deletions share a time
                     $layoutDeletions += [PSCustomObject]@{
-                        Time        = $deleteTime
+                        Time        = $cur.Time
                         Offset      = $pp.Offset
                         Size        = $pp.Size
                         PartitionId = $pp.PartitionId
@@ -806,14 +875,15 @@ function Check-PartitionStatus {
     }
 
     foreach ($rec in @($layoutDeletions | Sort-Object Time)) {
-        # a partition re-created at the same offset after the deletion is still a deletion,
-        # but the same event pair must not be counted twice
-        $key = "$($rec.Offset)|$($rec.Time.ToString('yyyyMMddHHmmss'))"
+        $key = "$($rec.Offset)|$($rec.PartitionId)|$($rec.Time.ToString('yyyyMMddHHmmssfff'))"
         if ($deletedKeys.ContainsKey($key)) { continue }
         $deletedKeys[$key] = $true
 
-        $letter = Resolve-DeletedDriveLetter -Offset $rec.Offset -Signature $rec.Signature -PartitionId $rec.PartitionId -Baseline $baseline
-        if (-not $letter) { $letter = "Unknown" }
+        $letter = ""
+        $mdHit = Find-LetterEntryForPartition -MdLetters $mdLetters -Offset $rec.Offset -Signature $rec.Signature -PartitionGuid $rec.PartitionId
+        if ($mdHit) { $letter = $mdHit.Letter }
+        if (-not $letter) { $letter = Find-LetterInBaseline -Baseline $baseline -Offset $rec.Offset -PartitionGuid $rec.PartitionId }
+        if ($letter) { $reportedLetters[$letter] = $true } else { $letter = "Unknown" }
 
         $deletedList += [PSCustomObject]@{
             Letter    = $letter
@@ -837,37 +907,35 @@ function Check-PartitionStatus {
             }
             if ($stillExists) { continue }
 
+            $bpLetter = ""
+            if ($bp.DriveLetter) { $bpLetter = ([string]$bp.DriveLetter).ToUpper() }
+
             $already = $deletedList | Where-Object {
-                ($_.Offset -eq $bp.Offset) -or ($bp.DriveLetter -and $_.Letter -eq ([string]$bp.DriveLetter).ToUpper())
+                ($_.Offset -eq $bp.Offset) -or ($bpLetter -and $_.Letter -eq $bpLetter)
             }
             if ($already) { continue }
 
-            $deleteTime = $null
-            $pnpMatch = @($pnpDeletions | Where-Object { $_.Offset -eq [long]$bp.Offset })
-            if ($pnpMatch.Count -gt 0) { $deleteTime = (@($pnpMatch | Sort-Object Time))[0].Time }
+            # exact time for this specific volume only
+            $bpGuid = (([string]$bp.Guid) -replace '[{}]', '').ToLower()
+            $volGuids = @()
+            $mdHit = Find-LetterEntryForPartition -MdLetters $mdLetters -Offset ([long]$bp.Offset) -Signature ([uint32]0) -PartitionGuid $bpGuid
+            if ($mdHit) { $volGuids = @($mdEntries | Where-Object { $_.Kind -eq 'Volume' -and $_.Hex -eq $mdHit.Hex } | ForEach-Object { $_.VolumeGuid }) }
 
-            if (-not $deleteTime) {
-                $deleteTime = Get-PnPVolumeDeleteTime -StorageDeviceId $bp.StorageDeviceId -DiskRegId $bp.DiskRegId -Offset $bp.Offset -AfterTime $logonTime
-            }
-            if (-not $deleteTime -and $bp.DriveLetter) {
-                $deleteTime = Get-VolumeHiddenTime -StorageDeviceId $bp.StorageDeviceId -DiskRegId $bp.DiskRegId -Offset $bp.Offset -DriveLetter $bp.DriveLetter -AfterTime $logonTime
-            }
+            $deleteTime = Get-PnpTimeForVolume -PnpRecords $pnpDeletions -VolumeGuids $volGuids -Offset ([long]$bp.Offset)
 
             $scanTime = Get-Date
             try {
                 if ($baseline.ScanTime -is [DateTime]) { $scanTime = $baseline.ScanTime }
                 elseif ($baseline.ScanTime) { $scanTime = [DateTime]::Parse($baseline.ScanTime) }
             } catch { $scanTime = Get-Date }
+
             $timeStr = if ($deleteTime) { $deleteTime.ToString("yyyy-MM-dd HH:mm:ss") } else {
                 "Unknown (Between $($scanTime.ToString('HH:mm:ss')) and $((Get-Date).ToString('HH:mm:ss')))"
             }
 
-            $letter = ""
-            if ($bp.DriveLetter) { $letter = ([string]$bp.DriveLetter).ToUpper() }
-            if (-not $letter) {
-                $letter = Resolve-DeletedDriveLetter -Offset ([long]$bp.Offset) -Signature ([uint32]0) -PartitionId ([string]$bp.Guid) -Baseline $baseline
-            }
-            if (-not $letter) { $letter = "Unknown" }
+            $letter = $bpLetter
+            if (-not $letter -and $mdHit) { $letter = $mdHit.Letter }
+            if ($letter) { $reportedLetters[$letter] = $true } else { $letter = "Unknown" }
 
             $deletedList += [PSCustomObject]@{
                 Letter    = $letter
@@ -880,66 +948,38 @@ function Check-PartitionStatus {
         }
     }
 
-    # --- 3) fallback: drive letters still registered in MountedDevices whose volume is gone ---
-    $mountedDevices = Get-ItemProperty -Path 'HKLM:\SYSTEM\MountedDevices' -ErrorAction SilentlyContinue
-    if ($mountedDevices) {
-        foreach ($prop in $mountedDevices.PSObject.Properties) {
-            $m = [regex]::Match($prop.Name, '^\\DosDevices\\([A-Za-z]):$')
-            if (-not $m.Success) { continue }
+    # --- 3) fallback: drive letters still registered in MountedDevices whose volume is gone.
+    #        The time comes from the Kernel-PnP teardown of THAT volume (matched by its own
+    #        volume GUID / byte offset). No evidence for this specific volume = not reported,
+    #        so an old unplugged drive never borrows someone else's timestamp. ---
+    foreach ($e in $mdLetters) {
+        if ($reportedLetters.ContainsKey($e.Letter)) { continue }
 
-            $letter = $m.Groups[1].Value.ToUpper()
-            if ($deletedList | Where-Object { $_.Letter -eq $letter }) { continue }
+        if ($e.PartitionGuid) {
+            if ($liveGuids.ContainsKey($e.PartitionGuid)) { continue }
+        } elseif ($e.Offset -ge 0) {
+            if ($liveOffsets.ContainsKey("$($e.Offset)")) { continue }
+        } else {
+            continue
+        }
 
-            $data = $prop.Value
-            if ($data -isnot [byte[]]) { continue }
+        if (Get-Volume -DriveLetter $e.Letter -ErrorAction SilentlyContinue) { continue }
 
-            $offset = [long]-1
-            $isGpt  = $false
-            $guid   = ""
+        $volGuids = @($mdEntries | Where-Object { $_.Kind -eq 'Volume' -and $_.Hex -eq $e.Hex } | ForEach-Object { $_.VolumeGuid })
+        $deleteTime = Get-PnpTimeForVolume -PnpRecords $pnpDeletions -VolumeGuids $volGuids -Offset $e.Offset
+        if (-not $deleteTime) { continue }
 
-            if ($data.Length -eq 12) {
-                $offset = [BitConverter]::ToInt64($data, 4)
-            } elseif ($data.Length -ge 24) {
-                $prefix = ""
-                try { $prefix = [Text.Encoding]::ASCII.GetString($data, 0, 8) } catch { }
-                if ($prefix -eq 'DMIO:ID:') {
-                    $isGpt = $true
-                    $guid  = ((Get-GuidFromBytes -Bytes $data -Offset 8) -replace '[{}]', '').ToLower()
-                }
-            }
+        $reportedLetters[$e.Letter] = $true
 
-            if ($isGpt) {
-                if (-not $guid -or $liveGuids.ContainsKey($guid)) { continue }
-            } elseif ($offset -ge 0) {
-                if ($liveOffsets.ContainsKey("$offset")) { continue }
-            } else {
-                continue
-            }
-
-            if (Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue) { continue }
-
-            $deleteTime = $null
-            if ($offset -ge 0) {
-                $pnpMatch = @($pnpDeletions | Where-Object { $_.Offset -eq $offset })
-                if ($pnpMatch.Count -gt 0) { $deleteTime = (@($pnpMatch | Sort-Object Time))[0].Time }
-            }
-            if (-not $deleteTime) {
-                $safeOffset = if ($offset -ge 0) { $offset } else { [long]0 }
-                $deleteTime = Get-VolumeHiddenTime -StorageDeviceId "" -DiskRegId "" -Offset $safeOffset -DriveLetter $letter -AfterTime $logonTime
-            }
-            if (-not $deleteTime) { continue }
-
-            $deletedList += [PSCustomObject]@{
-                Letter    = $letter
-                Timestamp = $deleteTime.ToString("yyyy-MM-dd HH:mm:ss")
-                Size      = "Unknown"
-                Type      = "Unknown"
-                SortTime  = $deleteTime
-                Offset    = $offset
-            }
+        $deletedList += [PSCustomObject]@{
+            Letter    = $e.Letter
+            Timestamp = $deleteTime.ToString("yyyy-MM-dd HH:mm:ss")
+            Size      = "Unknown"
+            Type      = "Unknown"
+            SortTime  = $deleteTime
+            Offset    = $e.Offset
         }
     }
-
 
     # ========================
     # OUTPUT
