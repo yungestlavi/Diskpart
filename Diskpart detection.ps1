@@ -31,6 +31,247 @@ function Check-PartitionStatus {
         return "$Bytes B"
     }
 
+    # ========================
+    # BASELINE MANAGEMENT
+    # ========================
+
+    function Get-PartitionSnapshot {
+        $snapshot = @()
+        $allParts = Get-Partition -ErrorAction SilentlyContinue
+
+        $allVolumes = Get-PnpDevice -Class Volume -ErrorAction SilentlyContinue
+        $volRelations = @{}
+        foreach ($v in $allVolumes) {
+            $rels = Get-PnpDeviceProperty -InstanceId $v.InstanceId -KeyName 'DEVPKEY_Device_PowerRelations' -ErrorAction SilentlyContinue
+            if ($rels.Data) {
+                $volRelations[$v.InstanceId] = $rels.Data -join ';'
+            }
+        }
+
+        foreach ($p in $allParts) {
+            $vol = $null
+            try { $vol = Get-Volume -Partition $p -ErrorAction SilentlyContinue } catch { }
+
+            $isSystem = $p.Type -in @('System', 'Reserved', 'Recovery', 'EFI', 'MSR') -or $p.IsSystem -or $p.IsBoot
+
+            $volumeId = ""
+            if ($vol -and $vol.UniqueId) { $volumeId = $vol.UniqueId }
+
+            $storageDeviceId = ""
+            $diskRegId = ""
+            
+            try {
+                $disk = Get-Disk -Number $p.DiskNumber -ErrorAction SilentlyContinue
+                if ($disk) {
+                    $wmiDisk = Get-WmiObject Win32_DiskDrive -Filter "Index=$($disk.Number)" -ErrorAction SilentlyContinue
+                    if ($wmiDisk -and $wmiDisk.PNPDeviceID) {
+                        $pnpId = $wmiDisk.PNPDeviceID
+                        $hexOffSearch = "#" + $p.Offset.ToString("X16")
+                        
+                        foreach ($key in $volRelations.Keys) {
+                            if ($volRelations[$key] -match [regex]::Escape($pnpId) -and $key -match $hexOffSearch) {
+                                $storageDeviceId = $key
+                                if ($key -match '^STORAGE\\VOLUME\\(\{[^}]+\})#') {
+                                    $diskRegId = $Matches[1]
+                                }
+                                break
+                            }
+                        }
+                    }
+                    
+                    if (-not $storageDeviceId) {
+                        $entries = Get-ChildItem -Path 'HKLM:\SYSTEM\CurrentControlSet\Enum\STORAGE\VOLUME' -ErrorAction SilentlyContinue
+                        foreach ($e in $entries) {
+                            $name = $e.PSChildName
+                            if ($name -match '^(\{[^}]+\})#([0-9A-Fa-f]+)$') {
+                                $regGuid = $Matches[1]
+                                $hexOff = $Matches[2]
+                                $decOff = [Convert]::ToInt64($hexOff, 16)
+                                if ([Math]::Abs($decOff - $p.Offset) -lt 65536) {
+                                    $diskRegId = $regGuid
+                                    $storageDeviceId = "STORAGE\VOLUME\$diskRegId#$hexOff"
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch { }
+
+            $snapshot += [PSCustomObject]@{
+                DiskNumber      = $p.DiskNumber
+                PartitionNumber = $p.PartitionNumber
+                DriveLetter     = if ($p.DriveLetter -and $p.DriveLetter -ne [char]0) { [string]$p.DriveLetter } else { "" }
+                Size            = $p.Size
+                Offset          = $p.Offset
+                Type            = [string]$p.Type
+                Guid            = [string]$p.Guid
+                VolumeId        = $volumeId
+                FileSystem      = if ($vol) { [string]$vol.FileSystem } else { "" }
+                Label           = if ($vol -and $vol.FileSystemLabel) { [string]$vol.FileSystemLabel } else { "" }
+                IsSystem        = $isSystem
+                IsHidden        = [bool]$p.IsHidden
+                StorageDeviceId = $storageDeviceId
+                DiskRegId       = $diskRegId
+            }
+        }
+        return $snapshot
+    }
+
+    function Save-Baseline {
+        param($Snapshot, $BootTime, $Path)
+        $baseline = @{
+            BootTime     = $BootTime.ToString("o")
+            ScanTime     = (Get-Date).ToString("o")
+            Partitions   = @($Snapshot | ForEach-Object {
+                @{
+                    DiskNumber      = $_.DiskNumber
+                    PartitionNumber = $_.PartitionNumber
+                    DriveLetter     = $_.DriveLetter
+                    Size            = $_.Size
+                    Offset          = $_.Offset
+                    Type            = $_.Type
+                    Guid            = $_.Guid
+                    VolumeId        = $_.VolumeId
+                    FileSystem      = $_.FileSystem
+                    Label           = $_.Label
+                    IsSystem        = $_.IsSystem
+                    IsHidden        = $_.IsHidden
+                    StorageDeviceId = $_.StorageDeviceId
+                    DiskRegId       = $_.DiskRegId
+                }
+            })
+        }
+        $baseline | ConvertTo-Json -Depth 5 | Out-File -FilePath $Path -Encoding UTF8 -Force
+    }
+
+    function Load-Baseline {
+        param($Path)
+        if (-not (Test-Path $Path)) { return $null }
+        try {
+            $raw = Get-Content -Path $Path -Raw -Encoding UTF8
+            $parsed = ($raw | ConvertFrom-Json)
+            if (-not $parsed.BootTime) { return $null }
+            return $parsed
+        } catch { return $null }
+    }
+
+    $currentSnapshot = Get-PartitionSnapshot
+    $baseline = Load-Baseline -Path $BaselinePath
+    $isNewSession = $false
+
+    if (-not $baseline -or ([DateTime]::Parse($baseline.BootTime)) -ne $bootTime) {
+        $isNewSession = $true
+        Save-Baseline -Snapshot $currentSnapshot -BootTime $bootTime -Path $BaselinePath
+        $baseline = Load-Baseline -Path $BaselinePath
+    } else {
+        $mergedPartitions = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($bp in $baseline.Partitions) { $mergedPartitions.Add($bp) }
+        
+        foreach ($cp in $currentSnapshot) {
+            $exists = $mergedPartitions | Where-Object { 
+                ($_.DiskNumber -eq $cp.DiskNumber -and $_.PartitionNumber -eq $cp.PartitionNumber -and $_.Offset -eq $cp.Offset) -or
+                ($_.VolumeId -and $_.VolumeId -eq $cp.VolumeId) -or
+                ($_.Guid -and $_.Guid -eq $cp.Guid -and $cp.Guid -ne "")
+            }
+            if (-not $exists) {
+                $mergedPartitions.Add($cp)
+            } else {
+                $exists[0].DriveLetter = $cp.DriveLetter
+                $exists[0].IsHidden = $cp.IsHidden
+                $exists[0].StorageDeviceId = $cp.StorageDeviceId
+                $exists[0].DiskRegId = $cp.DiskRegId
+            }
+        }
+        
+        $updatedBaseline = @{
+            BootTime = $baseline.BootTime
+            ScanTime = (Get-Date).ToString("o")
+            Partitions = $mergedPartitions.ToArray()
+        }
+        $updatedBaseline | ConvertTo-Json -Depth 5 | Out-File -FilePath $BaselinePath -Encoding UTF8 -Force
+        $baseline = Load-Baseline -Path $BaselinePath
+    }
+
+    # ========================
+    # FORENSIC TIMESTAMP FUNCTIONS
+    # ========================
+
+    function Get-PnPVolumeDeleteTime {
+        param(
+            [string]$StorageDeviceId,
+            [string]$DiskRegId,
+            [long]$Offset,
+            [DateTime]$AfterTime
+        )
+
+        if (-not $StorageDeviceId -and $DiskRegId) {
+            $hexOff = $Offset.ToString("X16")
+            $StorageDeviceId = "STORAGE\VOLUME\$DiskRegId#$hexOff"
+        }
+
+        if (-not $StorageDeviceId) { return $null }
+
+        try {
+            $pnpEvents = Get-WinEvent -LogName 'Microsoft-Windows-Kernel-PnP/Configuration' -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Id -eq 420 -and
+                    $_.TimeCreated -gt $AfterTime -and
+                    $_.Message -match [regex]::Escape($StorageDeviceId)
+                }
+
+            if (-not $pnpEvents -and $DiskRegId) {
+                $pnpEvents = Get-WinEvent -LogName 'Microsoft-Windows-Kernel-PnP/Configuration' -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.Id -eq 420 -and
+                        $_.TimeCreated -gt $AfterTime -and
+                        $_.Message -match 'VOLUME' -and
+                        $_.Message -match [regex]::Escape($DiskRegId)
+                    }
+            }
+
+            if ($pnpEvents) {
+                $sorted = @($pnpEvents | Sort-Object TimeCreated -Descending)
+                return $sorted[0].TimeCreated
+            }
+        } catch { }
+
+        return $null
+    }
+
+    function Get-VolumeHiddenTime {
+        param(
+            [string]$StorageDeviceId,
+            [string]$DiskRegId,
+            [long]$Offset,
+            [string]$DriveLetter,
+            [DateTime]$AfterTime
+        )
+
+        $bestTime = $null
+
+        $pnpTime = Get-PnPVolumeDeleteTime -StorageDeviceId $StorageDeviceId -DiskRegId $DiskRegId -Offset $Offset -AfterTime $AfterTime
+        if ($pnpTime) { $bestTime = $pnpTime }
+
+        if (-not $bestTime -and $DriveLetter) {
+            try {
+                $pattern1 = "\b" + [regex]::Escape($DriveLetter) + ":\b"
+                $pattern2 = "\\DosDevices\\" + [regex]::Escape($DriveLetter) + ":"
+                $sysEvents = Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $AfterTime } -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $msg = $_.Message
+                        $msg -and ($msg -match $pattern1 -or $msg -match $pattern2)
+                    }
+                if ($sysEvents) {
+                    $sorted = @($sysEvents | Sort-Object TimeCreated -Descending)
+                    $bestTime = $sorted[0].TimeCreated
+                }
+            } catch { }
+        }
+
+        return $bestTime
+    }
+
     function Get-LastKnownDriveLetter {
         param(
             [int]$DiskNumber,
@@ -61,7 +302,7 @@ function Check-PartitionStatus {
         try {
             $disk = Get-Disk -Number $DiskNumber -ErrorAction SilentlyContinue
             $diskSig = if ($disk -and $disk.Signature) { $disk.Signature } else { 0 }
-            
+
             $mountedDevices = Get-ItemProperty -Path 'HKLM:\SYSTEM\MountedDevices' -ErrorAction SilentlyContinue
             if (-not $mountedDevices) { return $null }
 
@@ -98,127 +339,154 @@ function Check-PartitionStatus {
         return $null
     }
 
-    $usedLetters = (Get-Partition -ErrorAction SilentlyContinue | Where-Object DriveLetter | Select-Object -ExpandProperty DriveLetter)
+    # ========================
+    # PARTITION ANALYSIS
+    # ========================
+
+    $usedLetters = @(Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and $_.DriveLetter -ne [char]0 } | Select-Object -ExpandProperty DriveLetter)
     $allLetters = 65..90 | ForEach-Object { [char]$_ }
     $availableLetters = $allLetters | Where-Object { $_ -notin $usedLetters -and $_ -notin @('A','B') }
-
-    $allPartitions = Get-Partition -ErrorAction SilentlyContinue
-    $activeDriveLetters = @($allPartitions | Where-Object DriveLetter | Select-Object -ExpandProperty DriveLetter)
 
     $visibleList = @()
     $hiddenList = @()
 
-    foreach ($part in $allPartitions) {
-        $vol = $null
-        try { $vol = Get-Volume -Partition $part -ErrorAction SilentlyContinue } catch { }
+    foreach ($snap in $currentSnapshot) {
+        if ($snap.DriveLetter -and -not $snap.IsHidden -and $snap.FileSystem) {
+            $labelStr = if ($snap.Label) { " [$($snap.Label)]" } else { "" }
+            $sizeStr = Format-Size $snap.Size
+            $visibleList += "[VISIBLE] Drive $($snap.DriveLetter):$labelStr ($($snap.FileSystem) - $sizeStr) - Disk $($snap.DiskNumber), Partition $($snap.PartitionNumber)"
+        } elseif (-not $snap.IsSystem) {
+            $lastLetter = Get-LastKnownDriveLetter -DiskNumber $snap.DiskNumber -PartitionNumber $snap.PartitionNumber -PartitionOffset $snap.Offset -PartitionGuid $snap.Guid
 
-        $hasLetter = [bool]($part.DriveLetter)
-        $isHidden = [bool]($part.IsHidden)
-        
-        $isSystemPartition = $part.Type -in @('System', 'Reserved', 'Recovery', 'EFI', 'MSR') -or $part.IsSystem -or $part.IsBoot
+            if (-not $lastLetter -and $baseline) {
+                $baseMatch = $baseline.Partitions | Where-Object {
+                    $_.DiskNumber -eq $snap.DiskNumber -and
+                    $_.PartitionNumber -eq $snap.PartitionNumber -and
+                    $_.DriveLetter
+                }
+                if ($baseMatch) { $lastLetter = $baseMatch.DriveLetter }
+            }
 
-        if ($hasLetter -and -not $isHidden -and $vol -and $vol.FileSystem) {
-            $labelStr = if ($vol.FileSystemLabel) { " [$($vol.FileSystemLabel)]" } else { "" }
-            $sizeStr = Format-Size $part.Size
-            $letterStr = $part.DriveLetter
-            $visibleList += "[VISIBLE] Drive ${letterStr}:$labelStr ($($vol.FileSystem) - $sizeStr) - Disk $($part.DiskNumber), Partition $($part.PartitionNumber)"
-        } elseif (-not $isSystemPartition) {
-            $lastLetter = Get-LastKnownDriveLetter -DiskNumber $part.DiskNumber -PartitionNumber $part.PartitionNumber -PartitionOffset $part.Offset -PartitionGuid $part.Guid
-            
-            $assignedDisplay = if ($part.DriveLetter) { "$($part.DriveLetter):" } else { "None" }
+            $assignedDisplay = if ($snap.DriveLetter) { "$($snap.DriveLetter):" } else { "None" }
             $previousDisplay = if ($lastLetter) { "$lastLetter`:" } else { "Unknown" }
+            $suggestedLetter = if ($lastLetter) { $lastLetter } else { if ($availableLetters) { [string]$availableLetters[0] } else { 'X' } }
+
+            $hiddenTime = Get-VolumeHiddenTime -StorageDeviceId $snap.StorageDeviceId -DiskRegId $snap.DiskRegId -Offset $snap.Offset -DriveLetter $lastLetter -AfterTime $logonTime
+            $hiddenTimeDisplay = if ($hiddenTime) { $hiddenTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "Unknown" }
+
+            $vol = $null
+            try {
+                $p = Get-Partition -DiskNumber $snap.DiskNumber -PartitionNumber $snap.PartitionNumber -ErrorAction SilentlyContinue
+                if ($p) { $vol = Get-Volume -Partition $p -ErrorAction SilentlyContinue }
+            } catch { }
 
             $hiddenList += [PSCustomObject]@{
-                DiskNumber      = $part.DiskNumber
-                PartitionNumber = $part.PartitionNumber
+                DiskNumber      = $snap.DiskNumber
+                PartitionNumber = $snap.PartitionNumber
                 DriveLetter     = $assignedDisplay
                 PreviousLetter  = $previousDisplay
-                SuggestedLetter = if ($lastLetter) { $lastLetter } else { if ($availableLetters) { $availableLetters[0] } else { 'X' } }
-                Size            = Format-Size $part.Size
-                Type            = $part.Type
-                IsHidden        = $part.IsHidden
-                FileSystem      = if ($vol) { $vol.FileSystem } else { "Unknown/None" }
+                SuggestedLetter = $suggestedLetter
+                Size            = Format-Size $snap.Size
+                Type            = $snap.Type
+                IsHidden        = $snap.IsHidden
+                FileSystem      = if ($vol) { $vol.FileSystem } else { if ($snap.FileSystem) { $snap.FileSystem } else { "Unknown/None" } }
+                HiddenTime      = $hiddenTimeDisplay
             }
         }
     }
 
-    $orphanedLetters = @()
+    # ========================
+    # DELETED PARTITIONS (BASELINE COMPARISON + ORPHANED LETTERS)
+    # ========================
+
+    $deletedList = @()
+
+    if ($baseline -and -not $isNewSession) {
+        foreach ($bp in $baseline.Partitions) {
+            if ($bp.IsSystem) { continue }
+            if (-not $bp.DriveLetter) { continue }
+
+            $stillExists = $currentSnapshot | Where-Object {
+                ($_.DiskNumber -eq $bp.DiskNumber -and $_.PartitionNumber -eq $bp.PartitionNumber -and $_.Offset -eq $bp.Offset) -or
+                ($_.VolumeId -and $_.VolumeId -eq $bp.VolumeId) -or
+                ($_.Guid -and $_.Guid -eq $bp.Guid -and $_.Guid -ne "")
+            }
+
+            $stillHasLetter = $currentSnapshot | Where-Object {
+                $_.DriveLetter -eq $bp.DriveLetter
+            }
+
+            if (-not $stillHasLetter) {
+                $deleteTime = Get-PnPVolumeDeleteTime -StorageDeviceId $bp.StorageDeviceId -DiskRegId $bp.DiskRegId -Offset $bp.Offset -AfterTime $logonTime
+
+                if (-not $deleteTime) {
+                    $deleteTime = Get-VolumeHiddenTime -StorageDeviceId $bp.StorageDeviceId -DiskRegId $bp.DiskRegId -Offset $bp.Offset -DriveLetter $bp.DriveLetter -AfterTime $logonTime
+                }
+
+                if ($stillExists) { continue }
+
+                $timeStr = if ($deleteTime) { $deleteTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "Between $(([DateTime]::Parse($baseline.ScanTime)).ToString('HH:mm:ss')) and $((Get-Date).ToString('HH:mm:ss'))" }
+                $sizeStr = Format-Size $bp.Size
+
+                $deletedList += [PSCustomObject]@{
+                    Letter    = $bp.DriveLetter
+                    Timestamp = $timeStr
+                    Size      = $sizeStr
+                    Type      = $bp.Type
+                    SortTime  = if ($deleteTime) { $deleteTime } else { Get-Date }
+                }
+            }
+        }
+    }
+
+    $activeDriveLetters = @($currentSnapshot | Where-Object { $_.DriveLetter } | Select-Object -ExpandProperty DriveLetter)
     $mountedDevices = Get-ItemProperty -Path 'HKLM:\SYSTEM\MountedDevices' -ErrorAction SilentlyContinue
     if ($mountedDevices) {
         $mountedDevices.PSObject.Properties | Where-Object { $_.Name -match '^\\DosDevices\\([A-Z]):$' } | ForEach-Object {
             $letter = $Matches[1]
             if ($letter -notin $activeDriveLetters) {
                 $v = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
-                if (-not $v) { $orphanedLetters += $letter }
+                if (-not $v) {
+                    $alreadyTracked = $deletedList | Where-Object { $_.Letter -eq $letter }
+                    if (-not $alreadyTracked) {
+                        $regData = $_.Value
+                        $diskRegId = ""
+                        $offset = [long]0
+
+                        if ($regData -and $regData.Length -eq 12) {
+                            $offset = [BitConverter]::ToInt64($regData, 4)
+                        }
+
+                        $deleteTime = Get-VolumeHiddenTime -StorageDeviceId "" -DiskRegId $diskRegId -Offset $offset -DriveLetter $letter -AfterTime $logonTime
+                        $timeStr = if ($deleteTime) { $deleteTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "Post-logon" }
+
+                        $deletedList += [PSCustomObject]@{
+                            Letter    = $letter
+                            Timestamp = $timeStr
+                            Size      = "Unknown"
+                            Type      = "Unknown"
+                            SortTime  = if ($deleteTime) { $deleteTime } else { Get-Date }
+                        }
+                    }
+                }
             }
         }
     }
 
-    function Get-DeletionEvidenceForDrive {
-        param(
-            [string]$TargetDriveLetter,
-            [DateTime]$AfterTime
-        )
-
-        $evidenceTimes = [System.Collections.Generic.List[DateTime]]::new()
-
-        try {
-            $secEvents = Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4688; StartTime = $AfterTime } -ErrorAction SilentlyContinue |
-                Where-Object { $_.ToXml() -match 'diskpart\.exe' }
-            foreach ($evt in $secEvents) { $evidenceTimes.Add($evt.TimeCreated) }
-        } catch { }
-
-        try {
-            $sysmonEvents = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Sysmon/Operational'; Id = 1; StartTime = $AfterTime } -ErrorAction SilentlyContinue |
-                Where-Object { $_.ToXml() -match 'diskpart\.exe' }
-            foreach ($evt in $sysmonEvents) { $evidenceTimes.Add($evt.TimeCreated) }
-        } catch { }
-
-        $prefetchPath = "$env:SystemRoot\Prefetch"
-        if (Test-Path $prefetchPath) {
-            Get-ChildItem -Path $prefetchPath -Filter "DISKPART*" -ErrorAction SilentlyContinue | ForEach-Object {
-                if ($_.LastWriteTime -gt $AfterTime) {
-                    $evidenceTimes.Add($_.LastWriteTime)
-                }
-            }
-        }
-
-        try {
-            $diagEvents = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Partition/Diagnostic'; StartTime = $AfterTime } -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $xml = $_.ToXml()
-                    $xml -match [regex]::Escape($TargetDriveLetter) -or $xml -match 'Delete' -or $xml -match 'Remove'
-                }
-            foreach ($evt in $diagEvents) { $evidenceTimes.Add($evt.TimeCreated) }
-        } catch { }
-
-        try {
-            $pattern1 = "\b" + [regex]::Escape($TargetDriveLetter) + ":\b"
-            $pattern2 = "\\DosDevices\\" + [regex]::Escape($TargetDriveLetter) + ":"
-            $sysEvents = Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $AfterTime } -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $msg = $_.Message
-                    $msg -and ($msg -match $pattern1 -or $msg -match $pattern2)
-                }
-            foreach ($evt in $sysEvents) { $evidenceTimes.Add($evt.TimeCreated) }
-        } catch { }
-
-        if ($evidenceTimes.Count -gt 0) {
-            return ($evidenceTimes | Sort-Object -Descending)[0]
-        }
-        return $null
-    }
+    # ========================
+    # OUTPUT
+    # ========================
 
     $headerAscii = @"
   ____  _     _                     _     ____       _           _             
  |  _ \(_)___| | ___ __   __ _ _ __| |_  |  _ \  ___| |_ ___  ___| |_ ___  _ __ 
- | | | | / __| |/ / '_ \ / _` | '__| __| | | | |/ _ \ __/ _ \/ __| __/ _ \| '__|
+ | | | | / __| |/ / '_ \ / _`` | '__| __| | | | |/ _ \ __/ _ \/ __| __/ _ \| '__|
  | |_| | \__ \   <| |_) | (_| | |  | |_  | |_| |  __/ ||  __/ (__| || (_) | |   
  |____/|_|___/_|\_\ .__/ \__,_|_|   \__| |____/ \___|\__\___|\___|\__\___/|_|   
                   |_|                                                          
 "@
     Write-Host $headerAscii -ForegroundColor Cyan
-    Write-Host " Made by yungestlavi 💜" -ForegroundColor Magenta
+    Write-Host " Made by yungestlavi $([char]::ConvertFromUtf32(0x1F49C))" -ForegroundColor Magenta
     Write-Host "================================================================" -ForegroundColor Cyan
 
     Write-Host "`n[1/3] VISIBLE & ACCESSIBLE PARTITIONS" -ForegroundColor Cyan
@@ -231,19 +499,11 @@ function Check-PartitionStatus {
     }
 
     Write-Host "`n[2/3] REMOVED PARTITIONS (POST-LOGON)" -ForegroundColor Cyan
-    $foundDeleted = $false
-    if ($orphanedLetters.Count -gt 0) {
-        foreach ($letter in $orphanedLetters) {
-            $deletedTime = Get-DeletionEvidenceForDrive -TargetDriveLetter $letter -AfterTime $logonTime
-            if ($deletedTime) {
-                $foundDeleted = $true
-                $timeStr = $deletedTime.ToString("yyyy-MM-dd HH:mm:ss")
-                Write-Host "  [DELETED] Drive ${letter}: - Timestamp: $timeStr" -ForegroundColor Red
-            }
+    if ($deletedList.Count -gt 0) {
+        $deletedList | Sort-Object SortTime -Descending | ForEach-Object {
+            Write-Host "  [DELETED] Drive $($_.Letter): - Timestamp: $($_.Timestamp) - Size: $($_.Size)" -ForegroundColor Red
         }
-    }
-    
-    if (-not $foundDeleted) {
+    } else {
         Write-Host "  No partition deletions detected since logon." -ForegroundColor Gray
     }
 
@@ -252,7 +512,7 @@ function Check-PartitionStatus {
         foreach ($h in $hiddenList) {
             $targetLetter = $h.SuggestedLetter
 
-            Write-Host "  [HIDDEN/INACCESSIBLE] Disk $($h.DiskNumber), Partition $($h.PartitionNumber) | Original Letter: $($h.PreviousLetter) | Assigned Letter: $($h.DriveLetter) | Size: $($h.Size) | Type: $($h.Type) | FileSystem: $($h.FileSystem)" -ForegroundColor Yellow
+            Write-Host "  [HIDDEN/INACCESSIBLE] Disk $($h.DiskNumber), Partition $($h.PartitionNumber) | Original Letter: $($h.PreviousLetter) | Assigned Letter: $($h.DriveLetter) | Size: $($h.Size) | Type: $($h.Type) | FileSystem: $($h.FileSystem) | Hidden at: $($h.HiddenTime)" -ForegroundColor Yellow
             Write-Host "    -> Step-by-step commands to reveal this partition in File Explorer:" -ForegroundColor Yellow
             Write-Host "       [Method 1: PowerShell (Run as Administrator)]" -ForegroundColor White
             Write-Host "         Get-Partition -DiskNumber $($h.DiskNumber) -PartitionNumber $($h.PartitionNumber) | Set-Partition -NewDriveLetter ${targetLetter}" -ForegroundColor DarkYellow
