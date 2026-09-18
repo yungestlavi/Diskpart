@@ -398,25 +398,28 @@ function Check-PartitionStatus {
         } catch { return "" }
     }
 
-    # Decodes a DRIVE_LAYOUT_INFORMATION_EX blob (the PartitionTable field of
-    # Microsoft-Windows-Partition/Diagnostic event 1006).
-    # Header = 48 bytes, each PARTITION_INFORMATION_EX entry = 144 bytes.
+    # Decodes the header of a DRIVE_LAYOUT_INFORMATION_EX blob (the
+    # PartitionTable field of Microsoft-Windows-Partition/Diagnostic event
+    # 1006): PartitionStyle + Mbr.Signature / Gpt.DiskId.
+    # CONFIRMED against real evidence: these header bytes are accurate (the
+    # signature read here matched the real MBR signatures of two independently
+    # verified drive letters). The variable-length partition array that is
+    # supposed to follow this header is NOT usable: even a disk with 5 live
+    # partitions decodes to zero entries, so this event's binary field only
+    # ever carries the fixed 48-byte header - no partition table. Do not try
+    # to read partitions out of it.
     function ConvertFrom-DriveLayoutBlob {
         param([byte[]]$Blob)
 
         $layout = [PSCustomObject]@{
-            Style      = "Unknown"
-            Signature  = [uint32]0
-            DiskId     = ""
-            Partitions = @()
+            Style     = "Unknown"
+            Signature = [uint32]0
+            DiskId    = ""
         }
-        if (-not $Blob -or $Blob.Length -lt 48) { return $layout }
+        if (-not $Blob -or $Blob.Length -lt 12) { return $layout }
 
         try {
             $style = [BitConverter]::ToUInt32($Blob, 0)
-            # bytes 4-7 are alignment padding, not a partition count field -
-            # the real count is derived from the array's own length below
-
             if ($style -eq 0) {
                 $layout.Style = "MBR"
                 $layout.Signature = [BitConverter]::ToUInt32($Blob, 8)
@@ -426,79 +429,27 @@ function Check-PartitionStatus {
             } else {
                 $layout.Style = "RAW"
             }
-
-            # NOTE: there is no usable partition-count field inside this blob at
-            # offset+4 - those 4 bytes are pure alignment padding before the
-            # Mbr.Signature / Gpt.DiskId union (confirmed: the MBR signature at
-            # offset+8 decodes correctly and matches the real disk signature).
-            # The true entry count must be derived from the array's own length.
-            $entrySize = 144
-            $base = 48
-            $count = [int][Math]::Floor(($Blob.Length - $base) / $entrySize)
-
-            $parts = @()
-            for ($i = 0; $i -lt $count; $i++) {
-                $o = $base + ($i * $entrySize)
-                if (($o + $entrySize) -gt $Blob.Length) { break }
-
-                $pStyle = [BitConverter]::ToUInt32($Blob, $o)
-                $start  = [BitConverter]::ToInt64($Blob, $o + 8)
-                $length = [BitConverter]::ToInt64($Blob, $o + 16)
-                $number = [int][BitConverter]::ToUInt32($Blob, $o + 24)
-                if ($length -le 0) { continue }
-
-                $partId  = ""
-                $typeStr = "Unknown"
-
-                if ($pStyle -eq 1) {
-                    $typeGuid = (Get-GuidFromBytes -Bytes $Blob -Offset ($o + 32)) -replace '[{}]', ''
-                    $partId   = Get-GuidFromBytes -Bytes $Blob -Offset ($o + 48)
-                    switch ($typeGuid.ToLower()) {
-                        'ebd0a0a2-b9e5-4433-87c0-68b6b72699c7' { $typeStr = "Basic" }
-                        'de94bba4-06d1-4d40-a16a-bfd50179d6ac' { $typeStr = "Recovery" }
-                        'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' { $typeStr = "System (EFI)" }
-                        'e3c9e316-0b5c-4db8-817d-f92df00215ae' { $typeStr = "Reserved (MSR)" }
-                        default                                { $typeStr = "GPT" }
-                    }
-                } else {
-                    $mbrType = $Blob[$o + 32]
-                    $partId  = Get-GuidFromBytes -Bytes $Blob -Offset ($o + 40)
-                    switch ($mbrType) {
-                        0x07    { $typeStr = "Basic (NTFS/exFAT)" }
-                        0x0B    { $typeStr = "Basic (FAT32)" }
-                        0x0C    { $typeStr = "Basic (FAT32 LBA)" }
-                        0x27    { $typeStr = "Recovery" }
-                        0xEE    { $typeStr = "GPT Protective" }
-                        default { $typeStr = ("MBR 0x{0:X2}" -f $mbrType) }
-                    }
-                }
-
-                $parts += [PSCustomObject]@{
-                    Number      = $number
-                    Offset      = $start
-                    Size        = $length
-                    PartitionId = $partId
-                    TypeName    = $typeStr
-                }
-            }
-            $layout.Partitions = $parts
         } catch { }
 
         return $layout
     }
 
-    # Reads the disk layout history recorded by Windows itself.
-    # Every time a partition table changes (create / delete / clean) Windows
-    # writes a new 1006 event containing the FULL partition table at that moment.
-    function Get-DiskLayoutHistory {
+    # Every 1006 event marks a moment when a disk's identity (MBR signature or
+    # GPT DiskId) was set. On this MBR disk the signature changes each time
+    # diskpart re-initializes it (e.g. after "clean"), so the sequence of
+    # signatures over time tells us WHICH partition existed at any given
+    # moment - which is what lets us tell apart several deletions that all
+    # happen at the exact same byte offset (diskpart always starts the first
+    # partition right after the MBR, so offset alone cannot distinguish them).
+    function Get-DiskSignatureTimeline {
         param([int]$MaxEvents = 600)
 
-        $history = @()
+        $timeline = @()
         $events = $null
         try {
             $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Partition/Diagnostic'; Id = 1006 } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue)
         } catch { $events = $null }
-        if (-not $events -or $events.Count -eq 0) { return $history }
+        if (-not $events -or $events.Count -eq 0) { return $timeline }
 
         foreach ($e in $events) {
             try {
@@ -510,41 +461,56 @@ function Check-PartitionStatus {
                         if ($fieldName) { $data[[string]$fieldName] = [string]$d.InnerText }
                     }
                 }
+                if (-not $data.ContainsKey('PartitionTable')) { continue }
 
-                $blob = $null
-                if ($data.ContainsKey('PartitionTable')) {
-                    $blob = Convert-HexStringToBytes -Hex $data['PartitionTable']
-                }
+                $blob = Convert-HexStringToBytes -Hex $data['PartitionTable']
+                if (-not $blob) { continue }
 
-                if ($blob) {
-                    $layout = ConvertFrom-DriveLayoutBlob -Blob $blob
-                    if ($layout.Style -ne "Unknown") {
-                        $diskNumber = -1
-                        if ($data.ContainsKey('DiskNumber') -and $data['DiskNumber'] -match '^\d+$') { $diskNumber = [int]$data['DiskNumber'] }
+                $layout = ConvertFrom-DriveLayoutBlob -Blob $blob
+                if ($layout.Style -eq "MBR" -and $layout.Signature -eq 0) { continue }
+                if ($layout.Style -eq "GPT" -and -not $layout.DiskId) { continue }
+                if ($layout.Style -eq "Unknown" -or $layout.Style -eq "RAW") { continue }
 
-                        $serial = ""
-                        if ($data.ContainsKey('SerialNumber') -and $data['SerialNumber']) { $serial = ([string]$data['SerialNumber']).Trim() }
+                $diskNumber = -1
+                if ($data.ContainsKey('DiskNumber') -and $data['DiskNumber'] -match '^\d+$') { $diskNumber = [int]$data['DiskNumber'] }
 
-                        # identity taken from the partition table itself: it stays stable
-                        # even when an event does not carry the serial number
-                        $key = "DISK:$diskNumber"
-                        if ($layout.DiskId) { $key = "ID:$($layout.DiskId)" }
-                        elseif ($layout.Signature -ne 0) { $key = "SIG:$($layout.Signature)" }
-                        elseif ($serial) { $key = "SN:$serial" }
-
-                        $history += [PSCustomObject]@{
-                            Time       = $e.TimeCreated
-                            DiskNumber = $diskNumber
-                            Serial     = $serial
-                            Key        = $key
-                            Layout     = $layout
-                        }
-                    }
+                $timeline += [PSCustomObject]@{
+                    Time       = $e.TimeCreated
+                    DiskNumber = $diskNumber
+                    Style      = $layout.Style
+                    Signature  = $layout.Signature
+                    DiskId     = $layout.DiskId
                 }
             } catch { }
         }
 
-        return $history
+        return @($timeline | Sort-Object Time)
+    }
+
+    # For a chronological list of PnP volume-teardown times, works out which
+    # disk identity (MBR signature / GPT DiskId) was active on the disk at
+    # each teardown moment, by looking at the most recent signature-timeline
+    # entry before it. Each timeline entry is consumed once, so if the same
+    # signature is reused later (diskpart can and does reuse an old MBR
+    # signature) two deletions of that same signature are still kept apart
+    # by time, never collapsed onto one match.
+    function Resolve-DeletionSignatures {
+        param($PnpDeleteTimes, $SignatureTimeline)
+
+        $results = @()
+        foreach ($t in @($PnpDeleteTimes | Sort-Object)) {
+            $active = $null
+            foreach ($entry in $SignatureTimeline) {
+                if ($entry.Time -le $t) { $active = $entry } else { break }
+            }
+            $results += [PSCustomObject]@{
+                Time      = $t
+                Signature = if ($active) { $active.Signature } else { [uint32]0 }
+                DiskId    = if ($active) { $active.DiskId } else { "" }
+                Style     = if ($active) { $active.Style } else { "" }
+            }
+        }
+        return $results
     }
 
     # Kernel-PnP "device deleted" records for volume devices: gives the exact
@@ -711,29 +677,24 @@ function Check-PartitionStatus {
         return $found
     }
 
-    # Exact teardown time of ONE volume device: matched either on its own volume GUID
-    # or on its byte offset, never on a generic text search in the System log.
+    # Exact teardown time of ONE volume device, matched on its own volume GUID.
+    # Offset is deliberately NOT used as a fallback here: on a disk where every
+    # partition starts at the same byte offset (diskpart always starts the
+    # first partition right after the MBR), matching by offset alone would
+    # return the SAME earliest event for every partition on that disk - which
+    # is exactly the bug that made every deletion show one identical timestamp.
     function Get-PnpTimeForVolume {
-        param($PnpRecords, $VolumeGuids, [long]$Offset)
+        param($PnpRecords, $VolumeGuids)
 
-        # the volume GUID is unique, the byte offset is not (two disks can share it),
-        # so the GUID always wins and the offset is only a second choice
+        if (-not $VolumeGuids) { return $null }
         $guidHits = @()
-        if ($VolumeGuids) {
-            foreach ($r in $PnpRecords) {
-                $instLower = ([string]$r.Instance).ToLower()
-                foreach ($g in $VolumeGuids) {
-                    if ($g -and $instLower.Contains([string]$g)) { $guidHits += $r; break }
-                }
+        foreach ($r in $PnpRecords) {
+            $instLower = ([string]$r.Instance).ToLower()
+            foreach ($g in $VolumeGuids) {
+                if ($g -and $instLower.Contains([string]$g)) { $guidHits += $r; break }
             }
         }
         if ($guidHits.Count -gt 0) { return (@($guidHits | Sort-Object Time))[0].Time }
-
-        if ($Offset -ge 0) {
-            $offsetHits = @($PnpRecords | Where-Object { $_.Offset -ge 0 -and $_.Offset -eq $Offset })
-            if ($offsetHits.Count -gt 0) { return (@($offsetHits | Sort-Object Time))[0].Time }
-        }
-
         return $null
     }
 
@@ -800,22 +761,25 @@ function Check-PartitionStatus {
     }
 
     # ========================
-    # DELETED PARTITIONS (EVENT LOG DIFF + BASELINE COMPARISON + ORPHANED LETTERS)
+    # DELETED PARTITIONS
+    #
+    # Primary evidence:
+    #   - Kernel-PnP/Configuration id 420 = exact second a volume device was
+    #     torn down (one event per deletion, always accurate).
+    #   - Microsoft-Windows-Partition/Diagnostic id 1006 = exact moment the
+    #     disk's MBR signature / GPT DiskId changed (also accurate - verified
+    #     against two independently confirmed drive letters). It does NOT
+    #     carry a partition table, so it is used only to tell apart several
+    #     deletions on a disk where every partition starts at the same offset.
+    #   - HKLM\SYSTEM\MountedDevices = stale letter -> signature/offset or
+    #     partition GUID mapping, kept by Windows even after the volume is gone.
+    #   - The session baseline, when this script already ran earlier in the
+    #     same boot session, for size/type of a since-deleted partition.
     # ========================
 
     $deletedList     = @()
-    $deletedKeys     = @{}
     $reportedLetters = @{}
-
-    # --- what is alive right now ---
-    $presentSerials     = @{}
-    $presentDiskNumbers = @{}
-    try {
-        foreach ($d in @(Get-Disk -ErrorAction SilentlyContinue)) {
-            $presentDiskNumbers[[int]$d.Number] = $true
-            if ($d.SerialNumber) { $presentSerials[([string]$d.SerialNumber).Trim()] = $true }
-        }
-    } catch { }
+    $consumedPnpTime = @{}
 
     $liveOffsets = @{}
     $liveGuids   = @{}
@@ -824,83 +788,71 @@ function Check-PartitionStatus {
         if ($cp.Guid) { $liveGuids[(([string]$cp.Guid) -replace '[{}]', '').ToLower()] = $true }
     }
 
-    $mdEntries     = @(Get-MountedDeviceEntries)
-    $mdLetters     = @($mdEntries | Where-Object { $_.Kind -eq 'Letter' })
-    $pnpDeletions  = @(Get-PnpVolumeDeletionRecords -AfterTime $logonTime)
-    $layoutHistory = @(Get-DiskLayoutHistory)
+    $mdEntries        = @(Get-MountedDeviceEntries)
+    $mdLetters        = @($mdEntries | Where-Object { $_.Kind -eq 'Letter' })
+    $pnpDeletions     = @(Get-PnpVolumeDeletionRecords -AfterTime $logonTime)
+    $sigTimeline      = @(Get-DiskSignatureTimeline)
+    $pnpDeleteTimes   = @($pnpDeletions | ForEach-Object { $_.Time } | Sort-Object)
+    $resolvedDeletions = @(Resolve-DeletionSignatures -PnpDeleteTimes $pnpDeleteTimes -SignatureTimeline $sigTimeline)
 
-    # --- 1) partition table diff: every single change has its own 1006 event,
-    #        so every deletion gets its own exact timestamp ---
-    $layoutDeletions = @()
-    if ($layoutHistory.Count -gt 0) {
-        foreach ($group in ($layoutHistory | Group-Object -Property Key)) {
-            $seq = @($group.Group | Sort-Object Time)
-            for ($i = 1; $i -lt $seq.Count; $i++) {
-                $prev = $seq[$i - 1]
-                $cur  = $seq[$i]
-                if ($cur.Time -le $logonTime) { continue }
+    function Claim-DeletionForSignature {
+        param([uint32]$Signature, [string]$DiskId)
 
-                $prevParts = @($prev.Layout.Partitions)
-                $curParts  = @($cur.Layout.Partitions)
-                if ($prevParts.Count -eq 0) { continue }
-
-                # a disk that vanished completely was unplugged, not wiped
-                # (if the disk is still attached, an empty table means "diskpart clean")
-                if ($curParts.Count -eq 0) {
-                    $diskStillAttached = $false
-                    if ($cur.Serial -and $presentSerials.ContainsKey($cur.Serial)) { $diskStillAttached = $true }
-                    if ($cur.DiskNumber -ge 0 -and $presentDiskNumbers.ContainsKey($cur.DiskNumber)) { $diskStillAttached = $true }
-                    if (-not $diskStillAttached) { continue }
-                }
-
-                foreach ($pp in $prevParts) {
-                    $ppId = (([string]$pp.PartitionId) -replace '[{}]', '').ToLower()
-                    if ($ppId -eq '00000000-0000-0000-0000-000000000000') { $ppId = "" }
-
-                    $stillThere = $curParts | Where-Object {
-                        ($_.Offset -eq $pp.Offset) -or
-                        ($ppId -and ((([string]$_.PartitionId) -replace '[{}]', '').ToLower()) -eq $ppId)
-                    }
-                    if ($stillThere) { continue }
-
-                    # the timestamp IS the event that no longer contains the partition:
-                    # one event per diskpart operation, so no two deletions share a time
-                    $layoutDeletions += [PSCustomObject]@{
-                        Time        = $cur.Time
-                        Offset      = $pp.Offset
-                        Size        = $pp.Size
-                        PartitionId = $pp.PartitionId
-                        TypeName    = $pp.TypeName
-                        Signature   = $prev.Layout.Signature
-                        DiskNumber  = $prev.DiskNumber
-                    }
-                }
-            }
+        $wantDiskId = (([string]$DiskId) -replace '[{}]', '').ToLower()
+        foreach ($r in $resolvedDeletions) {
+            $ts = $r.Time.ToString('o')
+            if ($consumedPnpTime.ContainsKey($ts)) { continue }
+            $isMatch = $false
+            if ($Signature -ne 0 -and $r.Signature -eq $Signature) { $isMatch = $true }
+            elseif ($wantDiskId -and $r.DiskId -and $r.DiskId.ToLower() -eq $wantDiskId) { $isMatch = $true }
+            if ($isMatch) { $consumedPnpTime[$ts] = $true; return $r.Time }
         }
+        return $null
     }
 
-    foreach ($rec in @($layoutDeletions | Sort-Object Time)) {
-        $key = "$($rec.Offset)|$($rec.PartitionId)|$($rec.Time.ToString('yyyyMMddHHmmssfff'))"
-        if ($deletedKeys.ContainsKey($key)) { continue }
-        $deletedKeys[$key] = $true
+    # --- letters still in MountedDevices whose volume is gone right now ---
+    foreach ($e in $mdLetters) {
+        if (Get-Volume -DriveLetter $e.Letter -ErrorAction SilentlyContinue) { continue }
+        if ($e.PartitionGuid) {
+            if ($liveGuids.ContainsKey($e.PartitionGuid)) { continue }
+        } elseif ($e.Offset -ge 0) {
+            if ($liveOffsets.ContainsKey("$($e.Offset)")) { continue }
+        } else {
+            continue
+        }
 
-        $letter = ""
-        $mdHit = Find-LetterEntryForPartition -MdLetters $mdLetters -Offset $rec.Offset -Signature $rec.Signature -PartitionGuid $rec.PartitionId
-        if ($mdHit) { $letter = $mdHit.Letter }
-        if (-not $letter) { $letter = Find-LetterInBaseline -Baseline $baseline -Offset $rec.Offset -PartitionGuid $rec.PartitionId }
-        if ($letter) { $reportedLetters[$letter] = $true } else { $letter = "Unknown" }
+        # try the volume-GUID-exact match first (works when Windows also kept
+        # a matching \??\Volume{GUID} entry for this letter), then fall back
+        # to the signature timeline
+        $deleteTime = $null
+        $volGuids = @($mdEntries | Where-Object { $_.Kind -eq 'Volume' -and $_.Hex -eq $e.Hex } | ForEach-Object { $_.VolumeGuid })
+        if ($volGuids) { $deleteTime = Get-PnpTimeForVolume -PnpRecords $pnpDeletions -VolumeGuids $volGuids }
+
+        if (-not $deleteTime) {
+            $deleteTime = Claim-DeletionForSignature -Signature $e.Signature -DiskId $e.PartitionGuid
+        }
+        if (-not $deleteTime) { continue }
+
+        $reportedLetters[$e.Letter] = $true
+
+        $sizeStr = "Unknown"
+        $typeStr = "Unknown"
+        if ($baseline -and $baseline.Partitions) {
+            $bm = $baseline.Partitions | Where-Object { $_.DriveLetter -and ([string]$_.DriveLetter).ToUpper() -eq $e.Letter }
+            if ($bm) { $sizeStr = Format-Size $bm[0].Size; $typeStr = $bm[0].Type }
+        }
 
         $deletedList += [PSCustomObject]@{
-            Letter    = $letter
-            Timestamp = $rec.Time.ToString("yyyy-MM-dd HH:mm:ss")
-            Size      = Format-Size $rec.Size
-            Type      = $rec.TypeName
-            SortTime  = $rec.Time
-            Offset    = $rec.Offset
+            Letter    = $e.Letter
+            Timestamp = $deleteTime.ToString("yyyy-MM-dd HH:mm:ss")
+            Size      = $sizeStr
+            Type      = $typeStr
+            SortTime  = $deleteTime
         }
     }
 
-    # --- 2) fallback: baseline saved earlier in this same session ---
+    # --- baseline entries (this session's own earlier scan) not currently present
+    #     and not already reported above via MountedDevices ---
     if ($baseline -and -not $isNewSession) {
         foreach ($bp in $baseline.Partitions) {
             if ($bp.IsSystem) { continue }
@@ -914,19 +866,17 @@ function Check-PartitionStatus {
 
             $bpLetter = ""
             if ($bp.DriveLetter) { $bpLetter = ([string]$bp.DriveLetter).ToUpper() }
+            if ($bpLetter -and $reportedLetters.ContainsKey($bpLetter)) { continue }
 
-            $already = $deletedList | Where-Object {
-                ($_.Offset -eq $bp.Offset) -or ($bpLetter -and $_.Letter -eq $bpLetter)
-            }
-            if ($already) { continue }
-
-            # exact time for this specific volume only
             $bpGuid = (([string]$bp.Guid) -replace '[{}]', '').ToLower()
-            $volGuids = @()
             $mdHit = Find-LetterEntryForPartition -MdLetters $mdLetters -Offset ([long]$bp.Offset) -Signature ([uint32]0) -PartitionGuid $bpGuid
-            if ($mdHit) { $volGuids = @($mdEntries | Where-Object { $_.Kind -eq 'Volume' -and $_.Hex -eq $mdHit.Hex } | ForEach-Object { $_.VolumeGuid }) }
 
-            $deleteTime = Get-PnpTimeForVolume -PnpRecords $pnpDeletions -VolumeGuids $volGuids -Offset ([long]$bp.Offset)
+            $deleteTime = $null
+            if ($mdHit) {
+                $volGuids = @($mdEntries | Where-Object { $_.Kind -eq 'Volume' -and $_.Hex -eq $mdHit.Hex } | ForEach-Object { $_.VolumeGuid })
+                if ($volGuids) { $deleteTime = Get-PnpTimeForVolume -PnpRecords $pnpDeletions -VolumeGuids $volGuids }
+                if (-not $deleteTime) { $deleteTime = Claim-DeletionForSignature -Signature $mdHit.Signature -DiskId $bpGuid }
+            }
 
             $scanTime = Get-Date
             try {
@@ -948,41 +898,25 @@ function Check-PartitionStatus {
                 Size      = Format-Size $bp.Size
                 Type      = $bp.Type
                 SortTime  = if ($deleteTime) { $deleteTime } else { $scanTime }
-                Offset    = [long]$bp.Offset
             }
         }
     }
 
-    # --- 3) fallback: drive letters still registered in MountedDevices whose volume is gone.
-    #        The time comes from the Kernel-PnP teardown of THAT volume (matched by its own
-    #        volume GUID / byte offset). No evidence for this specific volume = not reported,
-    #        so an old unplugged drive never borrows someone else's timestamp. ---
-    foreach ($e in $mdLetters) {
-        if ($reportedLetters.ContainsKey($e.Letter)) { continue }
-
-        if ($e.PartitionGuid) {
-            if ($liveGuids.ContainsKey($e.PartitionGuid)) { continue }
-        } elseif ($e.Offset -ge 0) {
-            if ($liveOffsets.ContainsKey("$($e.Offset)")) { continue }
-        } else {
-            continue
-        }
-
-        if (Get-Volume -DriveLetter $e.Letter -ErrorAction SilentlyContinue) { continue }
-
-        $volGuids = @($mdEntries | Where-Object { $_.Kind -eq 'Volume' -and $_.Hex -eq $e.Hex } | ForEach-Object { $_.VolumeGuid })
-        $deleteTime = Get-PnpTimeForVolume -PnpRecords $pnpDeletions -VolumeGuids $volGuids -Offset $e.Offset
-        if (-not $deleteTime) { continue }
-
-        $reportedLetters[$e.Letter] = $true
+    # --- any PnP teardown that never matched a known letter: a partition
+    #     that was created and deleted without ever being assigned a drive
+    #     letter. Still a real deletion, still reported, just with no letter
+    #     to show (matches the "Unknown/510MB"-style case). ---
+    foreach ($r in $resolvedDeletions) {
+        $ts = $r.Time.ToString('o')
+        if ($consumedPnpTime.ContainsKey($ts)) { continue }
+        $consumedPnpTime[$ts] = $true
 
         $deletedList += [PSCustomObject]@{
-            Letter    = $e.Letter
-            Timestamp = $deleteTime.ToString("yyyy-MM-dd HH:mm:ss")
+            Letter    = "Unknown"
+            Timestamp = $r.Time.ToString("yyyy-MM-dd HH:mm:ss")
             Size      = "Unknown"
             Type      = "Unknown"
-            SortTime  = $deleteTime
-            Offset    = $e.Offset
+            SortTime  = $r.Time
         }
     }
 
