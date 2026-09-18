@@ -98,6 +98,20 @@ function Check-PartitionStatus {
                 }
             } catch { }
 
+            $encryption = "None"
+            try {
+                if ($p.DriveLetter -and $p.DriveLetter -ne [char]0) {
+                    $bl = Get-CimInstance -Namespace "Root\CIMv2\Security\MicrosoftVolumeEncryption" -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$($p.DriveLetter):'" -ErrorAction SilentlyContinue
+                    if ($bl -and $bl.ProtectionStatus -ne 0) {
+                        $encryption = "BitLocker"
+                    }
+                }
+            } catch { }
+
+            if ($encryption -eq "None" -and -not $isSystem -and -not $vol.FileSystem) {
+                $encryption = "RAW (Possible Encrypted Container)"
+            }
+
             $snapshot += [PSCustomObject]@{
                 DiskNumber      = $p.DiskNumber
                 PartitionNumber = $p.PartitionNumber
@@ -113,6 +127,7 @@ function Check-PartitionStatus {
                 IsHidden        = [bool]$p.IsHidden
                 StorageDeviceId = $storageDeviceId
                 DiskRegId       = $diskRegId
+                Encryption      = $encryption
             }
         }
         return $snapshot
@@ -139,6 +154,7 @@ function Check-PartitionStatus {
                     IsHidden        = $_.IsHidden
                     StorageDeviceId = $_.StorageDeviceId
                     DiskRegId       = $_.DiskRegId
+                    Encryption      = $_.Encryption
                 }
             })
         }
@@ -181,6 +197,7 @@ function Check-PartitionStatus {
                 $exists[0].IsHidden = $cp.IsHidden
                 $exists[0].StorageDeviceId = $cp.StorageDeviceId
                 $exists[0].DiskRegId = $cp.DiskRegId
+                $exists[0].Encryption = $cp.Encryption
             }
         }
         
@@ -354,7 +371,9 @@ function Check-PartitionStatus {
         if ($snap.DriveLetter -and -not $snap.IsHidden -and $snap.FileSystem) {
             $labelStr = if ($snap.Label) { " [$($snap.Label)]" } else { "" }
             $sizeStr = Format-Size $snap.Size
-            $visibleList += "[VISIBLE] Drive $($snap.DriveLetter):$labelStr ($($snap.FileSystem) - $sizeStr) - Disk $($snap.DiskNumber), Partition $($snap.PartitionNumber)"
+            $encStr = if ($snap.Encryption -and $snap.Encryption -ne "None") { " [ENCRYPTED: $($snap.Encryption)]" } else { "" }
+            
+            $visibleList += "[VISIBLE] Drive $($snap.DriveLetter):$labelStr ($($snap.FileSystem) - $sizeStr) - Disk $($snap.DiskNumber), Partition $($snap.PartitionNumber)$encStr"
         } elseif (-not $snap.IsSystem) {
             $lastLetter = Get-LastKnownDriveLetter -DiskNumber $snap.DiskNumber -PartitionNumber $snap.PartitionNumber -PartitionOffset $snap.Offset -PartitionGuid $snap.Guid
 
@@ -380,6 +399,9 @@ function Check-PartitionStatus {
                 if ($p) { $vol = Get-Volume -Partition $p -ErrorAction SilentlyContinue }
             } catch { }
 
+            $fsDisplay = if ($vol) { $vol.FileSystem } else { if ($snap.FileSystem) { $snap.FileSystem } else { "Unknown/None" } }
+            $encStr = if ($snap.Encryption -and $snap.Encryption -ne "None") { " | Encryption: $($snap.Encryption)" } else { "" }
+
             $hiddenList += [PSCustomObject]@{
                 DiskNumber      = $snap.DiskNumber
                 PartitionNumber = $snap.PartitionNumber
@@ -389,7 +411,8 @@ function Check-PartitionStatus {
                 Size            = Format-Size $snap.Size
                 Type            = $snap.Type
                 IsHidden        = $snap.IsHidden
-                FileSystem      = if ($vol) { $vol.FileSystem } else { if ($snap.FileSystem) { $snap.FileSystem } else { "Unknown/None" } }
+                FileSystem      = $fsDisplay
+                EncryptionStr   = $encStr
                 HiddenTime      = $hiddenTimeDisplay
             }
         }
@@ -425,7 +448,9 @@ function Check-PartitionStatus {
 
                 if ($stillExists) { continue }
 
-                $timeStr = if ($deleteTime) { $deleteTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "Between $(([DateTime]::Parse($baseline.ScanTime)).ToString('HH:mm:ss')) and $((Get-Date).ToString('HH:mm:ss'))" }
+                # Se non c'è un deleteTime post-logon preciso, ignoriamo o flaggiamo comunque come eliminata nella sessione corrente. 
+                # Dato che era nella baseline di *questa* sessione, sappiamo che è stata eliminata di sicuro.
+                $timeStr = if ($deleteTime) { $deleteTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "Unknown (Between $(([DateTime]::Parse($baseline.ScanTime)).ToString('HH:mm:ss')) and $((Get-Date).ToString('HH:mm:ss')))" }
                 $sizeStr = Format-Size $bp.Size
 
                 $deletedList += [PSCustomObject]@{
@@ -458,14 +483,18 @@ function Check-PartitionStatus {
                         }
 
                         $deleteTime = Get-VolumeHiddenTime -StorageDeviceId "" -DiskRegId $diskRegId -Offset $offset -DriveLetter $letter -AfterTime $logonTime
-                        $timeStr = if ($deleteTime) { $deleteTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "Post-logon" }
-
-                        $deletedList += [PSCustomObject]@{
-                            Letter    = $letter
-                            Timestamp = $timeStr
-                            Size      = "Unknown"
-                            Type      = "Unknown"
-                            SortTime  = if ($deleteTime) { $deleteTime } else { Get-Date }
+                        
+                        # MODIFICA: Se deleteTime è nullo, significa che è un residuo vecchio (es. USB staccata giorni fa).
+                        # Non inseriamo nella lista deletedList se non abbiamo un evento specifico post-logon.
+                        if ($deleteTime) {
+                            $timeStr = $deleteTime.ToString("yyyy-MM-dd HH:mm:ss")
+                            $deletedList += [PSCustomObject]@{
+                                Letter    = $letter
+                                Timestamp = $timeStr
+                                Size      = "Unknown"
+                                Type      = "Unknown"
+                                SortTime  = $deleteTime
+                            }
                         }
                     }
                 }
@@ -512,7 +541,7 @@ function Check-PartitionStatus {
         foreach ($h in $hiddenList) {
             $targetLetter = $h.SuggestedLetter
 
-            Write-Host "  [HIDDEN/INACCESSIBLE] Disk $($h.DiskNumber), Partition $($h.PartitionNumber) | Original Letter: $($h.PreviousLetter) | Assigned Letter: $($h.DriveLetter) | Size: $($h.Size) | Type: $($h.Type) | FileSystem: $($h.FileSystem) | Hidden at: $($h.HiddenTime)" -ForegroundColor Yellow
+            Write-Host "  [HIDDEN/INACCESSIBLE] Disk $($h.DiskNumber), Partition $($h.PartitionNumber) | Original Letter: $($h.PreviousLetter) | Assigned Letter: $($h.DriveLetter) | Size: $($h.Size) | Type: $($h.Type) | FileSystem: $($h.FileSystem)$($h.EncryptionStr) | Hidden at: $($h.HiddenTime)" -ForegroundColor Yellow
             Write-Host "    -> Step-by-step commands to reveal this partition in File Explorer:" -ForegroundColor Yellow
             Write-Host "       [Method 1: PowerShell (Run as Administrator)]" -ForegroundColor White
             Write-Host "         Get-Partition -DiskNumber $($h.DiskNumber) -PartitionNumber $($h.PartitionNumber) | Set-Partition -NewDriveLetter ${targetLetter}" -ForegroundColor DarkYellow
