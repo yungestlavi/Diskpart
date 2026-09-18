@@ -176,7 +176,12 @@ function Check-PartitionStatus {
     $baseline = Load-Baseline -Path $BaselinePath
     $isNewSession = $false
 
-    if (-not $baseline -or ([DateTime]::Parse($baseline.BootTime)) -ne $bootTime) {
+    $baselineBoot = $null
+    if ($baseline -and $baseline.BootTime) {
+        $baselineBoot = if ($baseline.BootTime -is [DateTime]) { $baseline.BootTime } else { [DateTime]::Parse($baseline.BootTime) }
+    }
+
+    if (-not $baseline -or $baselineBoot -ne $bootTime) {
         $isNewSession = $true
         Save-Baseline -Snapshot $currentSnapshot -BootTime $bootTime -Path $BaselinePath
         $baseline = Load-Baseline -Path $BaselinePath
@@ -201,9 +206,13 @@ function Check-PartitionStatus {
             }
         }
         
+        # Format dates explicitly so they don't break when saving back
+        $btStr = if ($baseline.BootTime -is [DateTime]) { $baseline.BootTime.ToString("o") } else { $baseline.BootTime }
+        $stStr = (Get-Date).ToString("o")
+
         $updatedBaseline = @{
-            BootTime = $baseline.BootTime
-            ScanTime = (Get-Date).ToString("o")
+            BootTime = $btStr
+            ScanTime = $stStr
             Partitions = $mergedPartitions.ToArray()
         }
         $updatedBaseline | ConvertTo-Json -Depth 5 | Out-File -FilePath $BaselinePath -Encoding UTF8 -Force
@@ -448,9 +457,10 @@ function Check-PartitionStatus {
 
                 if ($stillExists) { continue }
 
-                # Se non c'è un deleteTime post-logon preciso, ignoriamo o flaggiamo comunque come eliminata nella sessione corrente. 
-                # Dato che era nella baseline di *questa* sessione, sappiamo che è stata eliminata di sicuro.
-                $timeStr = if ($deleteTime) { $deleteTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "Unknown (Between $(([DateTime]::Parse($baseline.ScanTime)).ToString('HH:mm:ss')) and $((Get-Date).ToString('HH:mm:ss')))" }
+                $timeStr = if ($deleteTime) { $deleteTime.ToString("yyyy-MM-dd HH:mm:ss") } else {
+                    $st = if ($baseline.ScanTime -is [DateTime]) { $baseline.ScanTime } else { [DateTime]::Parse($baseline.ScanTime) }
+                    "Between $($st.ToString('HH:mm:ss')) and $((Get-Date).ToString('HH:mm:ss'))"
+                }
                 $sizeStr = Format-Size $bp.Size
 
                 $deletedList += [PSCustomObject]@{
